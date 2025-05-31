@@ -476,7 +476,7 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
   }
 
 PASS_ACTION:;
-
+  // We will update the statistics
   struct pkt_md *md;
   __u32 md_key = 0;
   md = bpf_map_lookup_elem(&metadata, &md_key);
@@ -491,20 +491,27 @@ PASS_ACTION:;
   __sync_fetch_and_add(&md->bytes_cnt, pkt_len);
 
   if (pkt.connStatus == INVALID) {
-    bpf_log_err("Connection status is invalid\n");
+    bpf_log_err("Connection status is invalid, dropping packet\n");
     goto DROP;
   }
 
+  // Important Fix: We are swapping MAC addresses before redirect
+  if (swap_mac_addresses(data, data_end) < 0) {
+    bpf_log_err("Failed to swap MAC addresses\n");
+    goto DROP;
+  }
   if (ctx->ingress_ifindex == conntrack_cfg.if_index_if1) {
-    bpf_log_debug("Redirect pkt to IF2 iface with ifindex: %d\n",
-                  conntrack_cfg.if_index_if2);
+    bpf_log_debug("Redirecting packet: IF1 (%d) -> IF2 (%d)\n",
+                  conntrack_cfg.if_index_if1, conntrack_cfg.if_index_if2);
     return bpf_redirect(conntrack_cfg.if_index_if2, 0);
   } else if (ctx->ingress_ifindex == conntrack_cfg.if_index_if2) {
-    bpf_log_debug("Redirect pkt to IF1 iface with ifindex: %d\n",
-                  conntrack_cfg.if_index_if1);
+    bpf_log_debug("Redirecting packet: IF2 (%d) -> IF1 (%d)\n",
+                  conntrack_cfg.if_index_if2, conntrack_cfg.if_index_if1);
     return bpf_redirect(conntrack_cfg.if_index_if1, 0);
   } else {
-    bpf_log_err("Unknown interface. Dropping packet\n");
+    bpf_log_err("Unknown interface %d. Expected %d or %d\n",
+                ctx->ingress_ifindex, conntrack_cfg.if_index_if1,
+                conntrack_cfg.if_index_if2);
     goto DROP;
   }
 
