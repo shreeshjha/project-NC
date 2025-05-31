@@ -434,7 +434,7 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
         goto PASS_ACTION;
       } else if ((value->ipRev != ipRev) && (value->portRev != portRev)) {
         // Reverse direction - bidirectional flow
-        value->ttl = timestamp + UDP_FLOW_TIMEOUT;
+        value->ttl = timestamp + UDP_ESTABLISHED_TIMEOUT;
         value->state = ESTABLISHED; // Mark as bidirectional
         bpf_spin_unlock(&value->lock);
         bpf_log_debug("[UDP-REV] Bidirectional flow established\n");
