@@ -375,19 +375,31 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
 
   // New TCP Connection Handling
   TCP_MISS:;
-    if ((pkt.flags & TCPHDR_SYN) != 0) {
+    bpf_log_debug("New TCP connection attempt, flags: 0x%x\n", pkt.flags);
+
+    if (pkt.flags == TCPHDR_SYN) {
       newEntry.state = SYN_SENT;
       newEntry.ttl = timestamp + TCP_SYN_SENT;
-      newEntry.sequence = pkt.seqN;
+      newEntry.sequence = pkt.seqN + 1; // Expected Ack
 
       newEntry.ipRev = ipRev;
       newEntry.portRev = portRev;
 
       bpf_map_update_elem(&connections, &key, &newEntry, BPF_ANY);
+      bpf_log_debug(
+          "New TCP connection created: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u\n",
+          (pkt.srcIp) & 0xFF, (pkt.srcIp >> 8) & 0xFF, (pkt.srcIp >> 16) & 0xFF,
+          (pkt.srcIp >> 24) & 0xFF, bpf_ntohs(pkt.srcPort), (pkt.dstIp) & 0xFF,
+          (pkt.dstIp >> 8) & 0xFF, (pkt.dstIp >> 16) & 0xFF,
+          (pkt.dstIp >> 24) & 0xFF, bpf_ntohs(pkt.dstPort));
+      pkt.connStatus = NEW;
       goto PASS_ACTION;
     } else {
       // Validation failed
-      bpf_log_debug("Validation failed %d\n", pkt.flags);
+      bpf_log_debug("Invalid packet to start TCP connection. Expected SYN, got "
+                    "flags: 0x%x\n",
+                    pkt.flags);
+      pkt.connStatus = INVALID;
       goto PASS_ACTION;
     }
   }
