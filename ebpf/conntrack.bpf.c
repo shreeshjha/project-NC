@@ -151,147 +151,94 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
 
     // Here we are focusing on Forward Direction Processing
     TCP_FORWARD:;
+      bpf_log_debug("[FWD] Current state: %d, flags: 0x%x\n", value->state,
+                    pkt.flags);
+
       if (value->state == SYN_SENT) {
-        if ((pkt.flags & TCPHDR_SYN) != 0 &&
-            (pkt.flags | TCPHDR_SYN) == TCPHDR_SYN) {
+        // Expecting pure SYN retransmission
+        if (pkt.flags == TCPHDR_SYN) {
           value->ttl = timestamp + TCP_SYN_SENT;
           bpf_spin_unlock(&value->lock);
+          pkt.connStatus = ESTABLISHED;
           goto PASS_ACTION;
         } else {
           pkt.connStatus = INVALID;
           bpf_spin_unlock(&value->lock);
-          bpf_log_debug("[FW_DIRECTION] Failed ACK "
-                        "check in "
-                        "SYN_SENT state. Flags: %x\n",
+          bpf_log_debug("[FWD] Invalid flags in SYN_SENT state: 0x%x\n",
                         pkt.flags);
           goto PASS_ACTION;
         }
       }
 
       if (value->state == SYN_RECV) {
-        if ((pkt.flags & TCPHDR_ACK) != 0 &&
-            (pkt.flags | TCPHDR_ACK) == TCPHDR_ACK &&
-            (pkt.ackN == value->sequence)) {
+        // Expecting ACK to complete handshake
+        if (pkt.flags == TCPHDR_ACK && pkt.ackN == value->sequence) {
           value->state = ESTABLISHED;
           value->ttl = timestamp + TCP_ESTABLISHED;
-
           bpf_spin_unlock(&value->lock);
-          bpf_log_debug("[FW_DIRECTION] Changing "
-                        "state from "
-                        "SYN_RECV to ESTABLISHED\n");
-
+          bpf_log_debug("[FWD] Handshake complete: SYN_RECV -> ESTABLISHED\n");
+          pkt.connStatus = ESTABLISHED;
           goto PASS_ACTION;
         } else {
           pkt.connStatus = INVALID;
           bpf_spin_unlock(&value->lock);
-          bpf_log_debug("[FW_DIRECTION] Failed ACK "
-                        "check in "
-                        "SYN_RECV state. Flags: %x\n",
-                        pkt.flags);
+          bpf_log_debug("[FWD] Invalid ACK in SYN_RECV state. Expected ack: "
+                        "%u, got: %u, flags: 0x%x\n",
+                        value->sequence, pkt.ackN, pkt.flags);
           goto PASS_ACTION;
         }
       }
 
       if (value->state == ESTABLISHED) {
-        bpf_spin_unlock(&value->lock);
-        bpf_log_debug("Connnection is ESTABLISHED\n");
-        bpf_spin_lock(&value->lock);
-        if ((pkt.flags & TCPHDR_FIN) != 0) {
+        if (pkt.flags & TCPHDR_FIN) {
+          // Start connection termination
           value->state = FIN_WAIT_1;
           value->ttl = timestamp + TCP_FIN_WAIT;
-          value->sequence = pkt.ackN;
-
+          value->sequence = pkt.seqN + 1; // Expected ACK for FIN
           bpf_spin_unlock(&value->lock);
-          bpf_log_debug("[FW_DIRECTION] Changing "
-                        "state from "
-                        "ESTABLISHED to FIN_WAIT_1. Seq: %u\n",
-                        value->sequence);
-
+          bpf_log_debug(
+              "[FWD] Starting termination: ESTABLISHED -> FIN_WAIT_1\n");
+          pkt.connStatus = ESTABLISHED;
           goto PASS_ACTION;
         } else {
+          /* Data packet */
           value->ttl = timestamp + TCP_ESTABLISHED;
           bpf_spin_unlock(&value->lock);
+          pkt.connStatus = ESTABLISHED;
           goto PASS_ACTION;
         }
       }
 
       if (value->state == FIN_WAIT_1) {
-        if ((pkt.flags & TCPHDR_ACK) != 0 && (pkt.seqN == value->sequence)) {
-          value->state = FIN_WAIT_2;
-          value->ttl = timestamp + TCP_FIN_WAIT;
-          bpf_spin_unlock(&value->lock);
-          bpf_log_debug("[FW_DIRECTION] Changing "
-                        "state from "
-                        "FIN_WAIT_1 to FIN_WAIT_2\n");
-          bpf_spin_lock(&value->lock);
-        } else {
-          pkt.connStatus = INVALID;
-          bpf_spin_unlock(&value->lock);
-          bpf_log_debug("[FW_DIRECTION] Failed ACK "
-                        "check in "
-                        "FIN_WAIT_1 state. Flags: %x. AckSeq: %u\n",
-                        pkt.flags, pkt.ackN);
-          goto PASS_ACTION;
-        }
-      }
-
-      if (value->state == FIN_WAIT_2) {
-        if ((pkt.flags & TCPHDR_FIN) != 0) {
-          value->state = LAST_ACK;
-          value->ttl = timestamp + TCP_LAST_ACK;
-          value->sequence = pkt.ackN;
-
-          bpf_spin_unlock(&value->lock);
-          bpf_log_debug("[FW_DIRECTION] Changing "
-                        "state from "
-                        "FIN_WAIT_2 to LAST_ACK\n");
-
-          goto PASS_ACTION;
-        } else {
-          // Still receiving packets
-          value->ttl = timestamp + TCP_FIN_WAIT;
-          bpf_spin_unlock(&value->lock);
-          bpf_log_debug("[FW_DIRECTION] Failed FIN "
-                        "check in "
-                        "FIN_WAIT_2 state. Flags: %x. Seq: %u\n",
-                        pkt.flags, value->sequence);
-
-          goto PASS_ACTION;
-        }
-      }
-
-      if (value->state == LAST_ACK) {
-        if ((pkt.flags & TCPHDR_ACK && pkt.seqN == value->sequence) != 0) {
-          value->state = TIME_WAIT;
-          value->ttl = timestamp + TCP_LAST_ACK;
-
-          bpf_spin_unlock(&value->lock);
-          bpf_log_debug("[FW_DIRECTION] Changing "
-                        "state from "
-                        "LAST_ACK to TIME_WAIT\n");
-          goto PASS_ACTION;
-        }
-        value->ttl = timestamp + TCP_LAST_ACK;
+        // Should not receive packets in forward direction in FIN_WAIT_1
+        value->ttl = timestamp + TCP_FIN_WAIT;
         bpf_spin_unlock(&value->lock);
+        pkt.connStatus = ESTABLISHED;
         goto PASS_ACTION;
       }
 
-      if (value->state == TIME_WAIT) {
-        if (pkt.connStatus == NEW) {
-          bpf_spin_unlock(&value->lock);
-          goto TCP_MISS;
-        } else {
-          bpf_spin_unlock(&value->lock);
-          goto PASS_ACTION;
-        }
+      if (value->state == FIN_WAIT_2) {
+        // Still in closing, update timer
+        value->ttl = timestamp + TCP_FIN_WAIT;
+        bpf_spin_unlock(&value->lock);
+        pkt.connStatus = ESTABLISHED;
+        goto PASS_ACTION;
+      }
+
+      if (value->state == LAST_ACK || value->state == TIME_WAIT) {
+        // Connection closing
+        bpf_spin_unlock(&value->lock);
+        pkt.connStatus = ESTABLISHED;
+        goto PASS_ACTION;
       }
 
       bpf_spin_unlock(&value->lock);
-      bpf_log_debug("[FW_DIRECTION] Should not get here. "
-                    "Flags: %x. State: %d. \n",
-                    pkt.flags, value->state);
+      bpf_log_debug("[FWD] Unhandled state: %d, flags: 0x%x\n", value->state,
+                    pkt.flags);
+      pkt.connStatus = ESTABLISHED;
       goto PASS_ACTION;
 
+    // Reverse Direction Processing
     TCP_REVERSE:;
       if (value->state == SYN_SENT) {
         if ((pkt.flags & TCPHDR_ACK) != 0 && (pkt.flags & TCPHDR_SYN) != 0 &&
