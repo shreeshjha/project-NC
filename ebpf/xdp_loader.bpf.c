@@ -1,3 +1,4 @@
+#include "bpf_types_fix.h"
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 

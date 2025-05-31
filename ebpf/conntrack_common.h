@@ -44,11 +44,13 @@
 
 #define HEX_BE_ONE 0x1000000
 
-const volatile struct {
+struct conntrack_config {
   __u8 log_level;
   __u32 if_index_if1;
   __u32 if_index_if2;
-} conntrack_cfg = {};
+};
+
+extern const volatile struct conntrack_config conntrack_cfg;
 
 typedef __u8 __attribute__((__may_alias__)) __u8_alias_t;
 typedef __u16 __attribute__((__may_alias__)) __u16_alias_t;

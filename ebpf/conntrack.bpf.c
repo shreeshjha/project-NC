@@ -1,3 +1,5 @@
+#include "bpf_types_fix.h"
+#include "bpf_types_fix.h"
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 #include <linux/bpf.h>
