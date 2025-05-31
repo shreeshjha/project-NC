@@ -404,6 +404,77 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
     }
   }
 
+  // UDP Processing (Enhancement)
+  else if (pkt.l4proto == IPPROTO_UDP) {
+    bpf_log_debug("Processing UDP packet: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u\n",
+                  (pkt.srcIp) & 0xFF, (pkt.srcIp >> 8) & 0xFF,
+                  (pkt.srcIp >> 16) & 0xFF, (pkt.srcIp >> 24) & 0xFF,
+                  bpf_ntohs(pkt.srcPort), (pkt.dstIp) & 0xFF,
+                  (pkt.dstIp >> 8) & 0xFF, (pkt.dstIp >> 16) & 0xFF,
+                  (pkt.dstIp >> 24) & 0xFF, bpf_ntohs(pkt.dstPort));
+
+    value = bpf_map_lookup_elem(&connections, &key);
+    if (value != NULL) {
+      // Existing UDP flow
+      bpf_spin_lock(&value->lock);
+
+      // Check if flow expired
+      if (cleanup_expired_connection(&key, value, timestamp)) {
+        bpf_spin_unlock(&value->lock);
+        goto UDP_NEW_FLOW; // Treat as new flow
+      }
+
+      // Update flow timestamp and validate direction */
+      if ((value->ipRev == ipRev) && (value->portRev == portRev)) {
+        // Forward direction
+        value->ttl = timestamp + UDP_FLOW_TIMEOUT;
+        bpf_spin_unlock(&value->lock);
+        bpf_log_debug("[UDP-FWD] Updated existing flow timeout\n");
+        pkt.connStatus = ESTABLISHED;
+        goto PASS_ACTION;
+      } else if ((value->ipRev != ipRev) && (value->portRev != portRev)) {
+        // Reverse direction - bidirectional flow
+        value->ttl = timestamp + UDP_FLOW_TIMEOUT;
+        value->state = ESTABLISHED; // Mark as bidirectional
+        bpf_spin_unlock(&value->lock);
+        bpf_log_debug("[UDP-REV] Bidirectional flow established\n");
+        pkt.connStatus = ESTABLISHED;
+        goto PASS_ACTION;
+      } else {
+        // Direction mismatch - treat as new flow
+        bpf_spin_unlock(&value->lock);
+        goto UDP_NEW_FLOW;
+      }
+    }
+
+  UDP_NEW_FLOW:;
+    // Create new UDP flow entry
+    bpf_log_debug("Creating new UDP flow\n");
+
+    newEntry.state = NEW; // Start as unidirectional
+    newEntry.ttl = timestamp + UDP_FLOW_TIMEOUT;
+    newEntry.sequence = 0; // Not used for UDP
+    newEntry.ipRev = ipRev;
+    newEntry.portRev = portRev;
+
+    // Insert new flow into map
+    int result = bpf_map_update_elem(&connections, &key, &newEntry, BPF_ANY);
+    if (result != 0) {
+      bpf_log_err("Failed to insert new UDP flow (error: %d)\n", result);
+      pkt.connStatus = INVALID;
+    } else {
+      bpf_log_debug("New UDP flow created successfully\n");
+      pkt.connStatus = NEW;
+    }
+    goto PASS_ACTION;
+
+    // UNSUPPORTED PROTOCOLS
+  } else {
+    bpf_log_debug("Unsupported L4 protocol: %d\n", pkt.l4proto);
+    pkt.connStatus = INVALID;
+    goto PASS_ACTION;
+  }
+
 PASS_ACTION:;
 
   struct pkt_md *md;
