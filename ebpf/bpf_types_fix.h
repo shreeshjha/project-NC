@@ -1,12 +1,11 @@
-/* BPF types fix header */
 #ifndef __BPF_TYPES_FIX_H__
 #define __BPF_TYPES_FIX_H__
 
 #include <linux/types.h>
-/* Ensures basic types are defined */
+/* Here We Just are ensuring basic types are defined */
 #ifndef __u8
-#define __u8 unsigned char 
-#endif 
+#define __u8 unsigned char
+#endif
 
 #ifndef __u16
 #define __u16 unsigned short
@@ -18,7 +17,7 @@
 
 #ifndef __s8
 #define __s8 signed char
-#endif 
+#endif
 
 #ifndef __s16
 #define __s16 signed short
