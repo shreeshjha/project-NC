@@ -6,9 +6,8 @@
 
 ## Executive Summary
 
-This project transformed a non-functional eBPF/XDP TCP connection tracker into a fully operational, high-performance system. Key outcomes:
+This project transformed a basic eBPF/XDP TCP connection tracker into a fully operational, high-performance system. Key outcomes:
 
-- Restored **100% IPv4 connectivity** between two veth namespaces via MAC-swapping
 - Achieved **3.57 Gbps** sustained TCP throughput (up from 0.28 Gbps baseline) with **0% packet loss** and **0 retransmits**
 - Enabled **817 Mbps** UDP flows (4% receiver-side loss at 1 Gbps offered)
 - Added automatic per-flow TTL for garbage collection, preventing map exhaustion
@@ -22,52 +21,25 @@ This project transformed a non-functional eBPF/XDP TCP connection tracker into a
 
 Before any fixes, the tracker exhibited:
 
-- **Layer 2 Drop:** No MAC-swap → veth interfaces dropped IPv4 frames → 0% delivery
 - **Broken TCP Handshake:** SYN seen, but SYN-ACK/ACK never progressed → no established connections
 - **No RST/FIN Cleanup:** RSTs were ignored; FIN transitions violated RFC 793 → "zombie" entries persisted
-- **Zero Sustained TCP Throughput:**
+- **Limited TCP Throughput:**
   - **iperf3 baseline:** ~339 MB in first second (~2.84 Gbps), then 0 B for remaining 9 s → ~283 Mbps overall
   - 5 retransmits, handshake dropped after 1 s
 - **No UDP Support:** All UDP packets were treated as invalid → dropped
 
 ### 1.2 Root Causes
 
-1. **Missing MAC-Swap:** Packets forwarded without swapping Ethernet source/destination → dropped by veth driver
-2. **Faulty TCP-Flag Logic:** Incorrect Boolean expressions prevented detection of SYN+ACK and ACK
-3. **Absent RST/FIN Handling:** RST never cleaned up; FIN state transitions were incorrect
-4. **No TTL/Garbage Collection:** Connections never expired → map exhaustion under churn
-5. **UDP Flows Not Tracked:** UDP packets were classed as invalid → no UDP traffic passed
+1. **Faulty TCP-Flag Logic:** Incorrect Boolean expressions prevented detection of SYN+ACK and ACK
+2. **Absent RST/FIN Handling:** RST never cleaned up; FIN state transitions were incorrect
+3. **No TTL/Garbage Collection:** Connections never expired → map exhaustion under churn
+4. **UDP Flows Not Tracked:** UDP packets were classed as invalid → no UDP traffic passed
 
 ---
 
 ## 2. Key Fixes & Engineering Solutions
 
-### 2.1 Layer 2 MAC-Swap
-
-**Issue:** veth peers accept only frames with correct MAC. Original code simply `bpf_redirect()` without modifying MAC headers.
-
-**Solution:** Add an inline helper to swap `h_source` and `h_dest` in the Ethernet header before redirect:
-
-```c
-static __always_inline int swap_mac(void *data, void *data_end) {
-    struct ethhdr *eth = data;
-    if (data + sizeof(*eth) > data_end) return -1;
-    unsigned char tmp[6];
-    __builtin_memcpy(tmp,       eth->h_source, 6);
-    __builtin_memcpy(eth->h_source, eth->h_dest,   6);
-    __builtin_memcpy(eth->h_dest,   tmp,            6);
-    return 0;
-}
-
-// Usage in XDP program before redirect:
-if (swap_mac(data, data_end) < 0)
-    return XDP_DROP;
-return bpf_redirect(target_ifindex, 0);
-```
-
-**Impact:** Restored IPv4 forwarding from 0% to 100% success.
-
-### 2.2 TCP Flag Validation & Handshake Logic
+### 2.1 TCP Flag Validation & Handshake Logic
 
 **Issue:** Original code used expressions like:
 
@@ -99,7 +71,7 @@ if (pkt.flags == TCPHDR_ACK) {
 
 **Impact:** Full three-way handshake: `SYN_SENT` → `SYN_RECV` → `ESTABLISHED`.
 
-### 2.3 RST & FIN Handling
+### 2.2 RST & FIN Handling
 
 #### RST Handling
 
@@ -163,7 +135,7 @@ if (saved_state == LAST_ACK && pkt.flags == TCPHDR_ACK &&
 - FIN sequences proceed through `FIN_WAIT_1` → `FIN_WAIT_2` / `LAST_ACK` → `TIME_WAIT` → delete
 - No "zombie" entries remain
 
-### 2.4 Garbage Collection via TTL
+### 2.3 Garbage Collection via TTL
 
 **Issue:** Connections never expired, causing map exhaustion under churn.
 
@@ -198,7 +170,7 @@ goto PASS;
 
 **Impact:** Expired entries are removed lazily when accessed; map remains bounded under churn.
 
-### 2.5 UDP Flow Tracking
+### 2.4 UDP Flow Tracking
 
 **Issue:** UDP packets were treated as invalid → dropped.
 
@@ -263,7 +235,7 @@ if (pkt.l4proto == IPPROTO_UDP) {
    ```bash
    sudo cat /sys/kernel/debug/tracing/trace_pipe
    ```
-   - Verified `swap_mac`, packet parsing, state transitions, and `bpf_redirect()`
+   - Verified packet parsing, state transitions, and `bpf_redirect()`
 
 3. **Terminal 3 (iperf3):**
    - **TCP Server:**
@@ -325,7 +297,7 @@ if (pkt.l4proto == IPPROTO_UDP) {
 - **Retransmissions:** 0
 - **Loss:** 0%
 
-**Insight:** Achieved near line-rate IPv4 forwarding on veth interfaces.
+**Insight:** Achieved high-performance IPv4 forwarding with proper connection tracking.
 
 ### 3.2 UDP Throughput
 
@@ -356,7 +328,6 @@ if (pkt.l4proto == IPPROTO_UDP) {
 
 | Aspect | Chosen Approach | Rationale |
 |--------|----------------|-----------|
-| **MAC Handling** | In-place header swap | Required by veth forwarding; zero extra lookup. |
 | **TCP Flag Checks** | Exact bitmask comparisons | Ensures RFC 793 compliance; eliminates logical bugs. |
 | **RST/FIN Cleanup** | Immediate deletion on RST or final ACK | Prevents stale entries; enforces correct teardown. |
 | **Sequence Validation** | Relaxed for SYN+ACK (flag-only) | Compatible with Linux TCP ISN behavior; avoids false drops. |
@@ -370,7 +341,6 @@ if (pkt.l4proto == IPPROTO_UDP) {
 ## 5. Conclusion
 
 ### 1. Functionality Restored:
-- **Layer 2:** Correct MAC swapping enables IPv4 forwarding
 - **TCP:** RFC 793-compliant handshake and teardown, with RST/FIN cleanup
 - **UDP:** Flows tracked, bidirectional detection via TTL
 
@@ -384,8 +354,7 @@ if (pkt.l4proto == IPPROTO_UDP) {
 
 ### 4. Relevance:
 - Ready for any XDP-capable Linux 5.x+ environment
-- Near line-rate IPv4 connection tracking across veth namespaces
+- High-performance IPv4 connection tracking across network namespaces
 - Easily extended to additional protocols or namespaces
 
 ---
-
