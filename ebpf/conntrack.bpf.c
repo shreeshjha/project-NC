@@ -19,6 +19,11 @@
 #include "conntrack_parser.h"
 #include "conntrack_structs.h"
 
+/*
+    In the original, conntrack_cfg was a regular global that was sent via BPF
+   map. Here we Declare it volatile so the user can update configuration without
+   recompiling and this ensure the compiler doesn't optimize away reads.
+ */
 const volatile struct conntrack_config conntrack_cfg = {};
 
 SEC("xdp")
@@ -28,6 +33,9 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
   int ingress = ctx->ingress_ifindex;
 
   // ─── 1) Manual Ethernet‐header parse ───
+  // Original one relied entirely on parse_packet() to validate ethertype and
+  // headers. New one down below quickly check Ethernet type inline to drop
+  // non-IPv4/IPv6 early and save parse overhead.
   struct ethhdr *eth = data;
   if ((void *)eth + sizeof(*eth) > data_end) {
     return XDP_DROP;
@@ -46,6 +54,9 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
     return XDP_DROP;
   }
   // ────────────────────────────────────────
+  // Parsing IP/TCP/UDP heaeders and populating packetHeaders struct
+  // Original implementation used same parse_packet() call but without the
+  // manual Ethernet check.
 
   struct packetHeaders pkt;
   if (parse_packet(data, data_end, &pkt) < 0) {
@@ -54,8 +65,13 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
   }
   bpf_log_debug("Packet parsed, now starting the conntrack.\n");
 
+  // Here we are building normalized 5-tuple key
+  // Using C99 zero initialization instead of __builtin_memset from original.
   struct ct_k key = {};
   uint8_t ipRev = 0, portRev = 0;
+
+  // We are maintaining same ordering logic as original which had smaller IP
+  // first, then smaller port.
   if (pkt.srcIp <= pkt.dstIp) {
     key.srcIp = pkt.srcIp;
     key.dstIp = pkt.dstIp;
@@ -76,18 +92,25 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
     key.dstPort = pkt.srcPort;
     portRev = 1;
   } else {
+    // If ports are equal then we use ipRev to break tie (this is same as
+    // original implementation, I didn't change much here)
     key.srcPort = pkt.srcPort;
     key.dstPort = pkt.dstPort;
     portRev = ipRev;
   }
 
-  struct ct_v newEntry = {};
+  struct ct_v newEntry = {}; // Zero init instead of memset
   struct ct_v *value;
-  uint64_t timestamp = bpf_ktime_get_ns();
+  uint64_t timestamp =
+      bpf_ktime_get_ns(); // I retained it from original implementation
 
+  // This is TCP Conntrack Logic
   if (pkt.l4proto == IPPROTO_TCP) {
     bpf_log_debug("Processing TCP packet, flags: 0x%x\n", pkt.flags);
-
+    // Here is the Explicit RST Handling
+    // In Original Implementation the issue was that it was simply skipping the
+    // RST packets with "goto PASS_ACTION" The fix I did here is if RST is seen,
+    // delete any existing connection and forward/drop normally
     if ((pkt.flags & TCPHDR_RST) != 0) {
       bpf_log_debug("RST packet received\n");
       value = bpf_map_lookup_elem(&connections, &key);
@@ -98,7 +121,7 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
       pkt.connStatus = ESTABLISHED;
       goto PASS_ACTION;
     }
-
+    // Here we are looking up existing connection state
     value = bpf_map_lookup_elem(&connections, &key);
     if (value) {
       __u32 saved_state = value->state;
@@ -122,6 +145,7 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
       if (is_forward_direction) {
         // ─ Forward direction ─
         if (saved_state == SYN_SENT) {
+          // In original implementation it required exact SYN flag check.
           if (pkt.flags == TCPHDR_SYN) {
             value->ttl = timestamp + TCP_SYN_SENT;
             bpf_spin_unlock(&value->lock);
@@ -137,6 +161,9 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
           }
         }
         if (saved_state == SYN_RECV) {
+          // In original it was required checking ack number against saved
+          // sequence The fix is accept any ACK as handshake completion (this is
+          // simpler but we are trusting parse_packet for seq correctness)
           if (pkt.flags == TCPHDR_ACK) {
             // Accept any ACK to complete the handshake
             value->state = ESTABLISHED;
@@ -154,6 +181,8 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
           }
         }
         if (saved_state == ESTABLISHED) {
+          // On FIN we are moving to FIN_WAIT_1 and storing the nexet expected
+          // seq (The original stored pkt.ackN whereas here we store pkt.seqN+1)
           if (pkt.flags & TCPHDR_FIN) {
             value->state = FIN_WAIT_1;
             value->ttl = timestamp + TCP_FIN_WAIT;
@@ -163,6 +192,7 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
             pkt.connStatus = ESTABLISHED;
             goto PASS_ACTION;
           } else {
+            // Normal refresh TTL like original did in established
             value->ttl = timestamp + TCP_ESTABLISHED;
             bpf_spin_unlock(&value->lock);
             pkt.connStatus = ESTABLISHED;
@@ -170,22 +200,29 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
           }
         }
         if (saved_state == FIN_WAIT_1) {
+          // Original required an ACK matching seq; new simply refreshes
+          // TTL/backoff for simplicity.
           value->ttl = timestamp + TCP_FIN_WAIT;
           bpf_spin_unlock(&value->lock);
           pkt.connStatus = ESTABLISHED;
           goto PASS_ACTION;
         }
         if (saved_state == FIN_WAIT_2) {
+          // Original waited for FIN; new just refreshes TTL until FIN seen.
           value->ttl = timestamp + TCP_FIN_WAIT;
           bpf_spin_unlock(&value->lock);
           pkt.connStatus = ESTABLISHED;
           goto PASS_ACTION;
         }
         if (saved_state == LAST_ACK || saved_state == TIME_WAIT) {
+          // Once in LAST_ACK or TIME_WAIT, just pass with refreshed TTL or no
+          // change (original let it pass)
           bpf_spin_unlock(&value->lock);
           pkt.connStatus = ESTABLISHED;
           goto PASS_ACTION;
         }
+        // Unhandled forward state: fall back to passing packet (original also
+        // had a catch-all).
         bpf_spin_unlock(&value->lock);
         pkt.connStatus = ESTABLISHED;
         bpf_log_debug("[FWD] Unhandled state: %d, flags: 0x%x\n", saved_state,
@@ -194,6 +231,8 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
       } else {
         // ─ Reverse direction ─
         if (saved_state == SYN_SENT) {
+          // Original required both SYN and ACK in reverse direction. We
+          // replicate that.
           if ((pkt.flags & (TCPHDR_SYN | TCPHDR_ACK)) ==
               (TCPHDR_SYN | TCPHDR_ACK)) {
             // For SYN+ACK, we don't need to validate the exact ack number
@@ -214,6 +253,7 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
           }
         }
         if (saved_state == SYN_RECV) {
+          // Original accepted any second SYN+ACK to keep waiting for final ACK.
           if ((pkt.flags & (TCPHDR_SYN | TCPHDR_ACK)) ==
               (TCPHDR_SYN | TCPHDR_ACK)) {
             value->ttl = timestamp + TCP_SYN_RECV;
@@ -251,6 +291,7 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
             pkt.connStatus = ESTABLISHED;
             goto PASS_ACTION;
           } else if (pkt.flags & TCPHDR_FIN) {
+            // Simultaneous close: both sides send FIN.
             value->state = LAST_ACK;
             value->ttl = timestamp + TCP_LAST_ACK;
             value->sequence = pkt.seqN + 1;
@@ -281,6 +322,8 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
           }
         }
         if (saved_state == LAST_ACK) {
+          // Original implementation required pkt.seqN == value->sequence to
+          // close. We keep that check.
           if (pkt.flags == TCPHDR_ACK && pkt.seqN == value->sequence) {
             bpf_spin_unlock(&value->lock);
             bpf_map_delete_elem(&connections, &key);
@@ -295,10 +338,13 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
           }
         }
         if (saved_state == TIME_WAIT) {
+          // Once in TIME_WAIT, we keep packets passing but do not reset timers
+          // (original did similar).
           bpf_spin_unlock(&value->lock);
           pkt.connStatus = ESTABLISHED;
           goto PASS_ACTION;
         }
+        // Unhandled reverse state: simply pass
         bpf_spin_unlock(&value->lock);
         pkt.connStatus = ESTABLISHED;
         bpf_log_debug("[REV] Unhandled state: %d flags: 0x%x\n", saved_state,
@@ -313,7 +359,8 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
     if (pkt.flags == TCPHDR_SYN) {
       newEntry.state = SYN_SENT;
       newEntry.ttl = timestamp + TCP_SYN_SENT;
-      newEntry.sequence = pkt.seqN + 1;
+      newEntry.sequence =
+          pkt.seqN + 1; // In original we used HEX_BE_ONE, here +1 suffices
       newEntry.ipRev = ipRev;
       newEntry.portRev = portRev;
 
@@ -337,6 +384,8 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
 
   // ======== UDP ========
   else if (pkt.l4proto == IPPROTO_UDP) {
+    // In original implementation UDP was treated as unsupported Here is the
+    // implementation of track simple UDP “flows” with TTL expiration.
     bpf_log_debug("Processing UDP packet: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u\n",
                   (pkt.srcIp) & 0xFF, (pkt.srcIp >> 8) & 0xFF,
                   (pkt.srcIp >> 16) & 0xFF, (pkt.srcIp >> 24) & 0xFF,
@@ -352,17 +401,20 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
 
       bpf_spin_lock(&value->lock);
       if (saved_ttl < timestamp) {
+        // // This is Expired—delete and fall through to new flow creation
         bpf_spin_unlock(&value->lock);
         bpf_map_delete_elem(&connections, &key);
         goto UDP_NEW_FLOW;
       }
       if (saved_ipRev == ipRev && saved_portRev == portRev) {
+        // if same direction we referesh TTL
         value->ttl = timestamp + UDP_FLOW_TIMEOUT;
         bpf_spin_unlock(&value->lock);
         bpf_log_debug("[UDP-FWD] Updated flow timeout\n");
         pkt.connStatus = ESTABLISHED;
         goto PASS_ACTION;
       } else if (saved_ipRev != ipRev && saved_portRev != portRev) {
+        // If reverse direction seen we upgrade to bidirectional longer timeout
         value->ttl = timestamp + UDP_ESTABLISHED_TIMEOUT;
         value->state = ESTABLISHED;
         bpf_spin_unlock(&value->lock);
@@ -370,6 +422,8 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
         pkt.connStatus = ESTABLISHED;
         goto PASS_ACTION;
       } else {
+        // Partial mismatch where IP reverset but port equal or etc we treat as
+        // new flow
         bpf_spin_unlock(&value->lock);
         goto UDP_NEW_FLOW;
       }
@@ -393,7 +447,8 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
     goto PASS_ACTION;
   }
 
-  // ======== Unsupported L4 ========
+  // ======== Unsupported L4 (same as original implementation didnt change here
+  // much) ========
   else {
     bpf_log_debug("Unsupported L4 protocol: %d\n", pkt.l4proto);
     pkt.connStatus = INVALID;
@@ -401,6 +456,8 @@ int xdp_conntrack_prog(struct xdp_md *ctx) {
   }
 
 PASS_ACTION:;
+  // metadata accounting, this is same as original we lookup metadata, increment
+  // packet/byte counters
   struct pkt_md *md;
   __u32 md_key = 0;
   md = bpf_map_lookup_elem(&metadata, &md_key);
@@ -438,3 +495,23 @@ DROP:;
 }
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
+
+/* Some of the resource/references that I used to refactor/fix original
+implementaton were: 1) eBPF Developer Tutorial: Learning eBPF Step by Step with
+Examples(https://github.com/eunomia-bpf/bpf-developer-tutorial) 2) Gentle
+Introduction to XDP (Datadog)
+(https://www.datadoghq.com/blog/xdp-intro/#:~:text=struct%20ethhdr%20) 3) ebpf
+Documentation for Concurrency, Spin Locks and Timers:
+ - Concurrency:
+(https://docs.ebpf.io/linux/concepts/concurrency/#:~:text=To%20use%20spin%20locks%2C%20you,top%20of%20your%20map%20value)
+ - Timers:
+(https://docs.ebpf.io/linux/concepts/timers/#:~:text=Timers%20allow%20eBPF%20programs%20to,being%20pruned%20due%20to%20inactivity)
+4) Nakryiko’s Blog for Using bpf_trace_printk and bpf_printk:
+//
+(https://nakryiko.com/posts/bpf-tips-printk/#:~:text=Any%20non,detect%20and%20handle%20those%20changes)
+5) Sysdig Blog: “The Art of Writing eBPF Programs: a Primer”
+(https://sysdig.com/blog/the-art-of-writing-ebpf-programs-a-primer/#:~:text=There%20is%20a%20lot%20to,abstracting%20away%20too%20many%20steps)
+6) Cillium's eBPF Connection Tracking
+(https://docs.cilium.io/en/stable/network/ebpf/maps/) Looked at this for
+understanding high performance conntrack in eBPF
+*/
