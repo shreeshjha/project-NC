@@ -14,6 +14,7 @@
 #include "log.h"
 
 #include "conntrack_if_helper.h"
+#include "ebpf/conntrack_common.h"
 #include "conntrack.skel.h"
 #include "ebpf/conntrack_structs.h"
 

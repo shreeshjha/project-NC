@@ -8,9 +8,9 @@
 
 #define FORCE_INLINE inline __attribute__((__always_inline__))
 
+#include <linux/types.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <linux/types.h>
 
 #define ICMP_ECHOREPLY 0       /* Echo Reply			*/
 #define ICMP_ECHO 8            /* Echo Request			*/
@@ -32,18 +32,25 @@
 #define TCP_FIN_WAIT 120000000000
 #define TCP_TIME_WAIT 120000000000
 
+// Timeout for UDP Flow Tracking
+#define UDP_FLOW_TIMEOUT 300000000000ULL
+
 #define TCPHDR_FIN 0x01
 #define TCPHDR_SYN 0x02
 #define TCPHDR_RST 0x04
+#define TCPHDR_PSH 0x08
 #define TCPHDR_ACK 0x10
+#define TCPHDR_URG 0x20
 
 #define HEX_BE_ONE 0x1000000
 
-const volatile struct {
-    __u8 log_level;
-    __u32 if_index_if1;
-    __u32 if_index_if2;
-} conntrack_cfg = {};
+struct conntrack_config {
+  __u8 log_level;
+  __u32 if_index_if1;
+  __u32 if_index_if2;
+};
+
+extern const volatile struct conntrack_config conntrack_cfg;
 
 typedef __u8 __attribute__((__may_alias__)) __u8_alias_t;
 typedef __u16 __attribute__((__may_alias__)) __u16_alias_t;
